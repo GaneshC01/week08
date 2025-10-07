@@ -1,0 +1,65 @@
+name: AKS Monorepo CI/CD
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  ACR_LOGIN: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+
+jobs:
+  test_backends:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: |
+          pip install --upgrade pip pytest httpx
+          for req in backend/*/requirements.txt; do pip install -r "$req"; done
+          pytest -q backend/product_service
+          pytest -q backend/order_service
+
+  build_push_backends:
+    needs: test_backends
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - run: |
+          az acr build -r ${{ env.ACR_LOGIN }} -t product_service:latest backend/product_service
+          az acr build -r ${{ env.ACR_LOGIN }} -t order_service:latest backend/order_service
+      - run: az logout
+
+  deploy_all:
+    needs: build_push_backends
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - run: |
+          az aks get-credentials --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} --name ${{ secrets.AKS_CLUSTER_NAME }} --overwrite-existing
+          az aks update -g ${{ secrets.AKS_RESOURCE_GROUP }} -n ${{ secrets.AKS_CLUSTER_NAME }} --attach-acr ${{ env.ACR_LOGIN }}
+          kubectl apply -f k8s/configmaps.yaml
+          kubectl apply -f k8s/secrets.yaml
+          kubectl apply -f k8s/product-db.yaml
+          kubectl apply -f k8s/order-db.yaml
+          kubectl apply -f k8s/product-service.yaml
+          kubectl apply -f k8s/order-service.yaml
+          kubectl rollout status deploy/product-service-w09-aks --timeout=300s || true
+          kubectl rollout status deploy/order-service-w09-aks --timeout=300s || true
+      - run: |
+          P=$(kubectl get svc product-service-w09-aks -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          O=$(kubectl get svc order-service-w09-aks -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          sed -i "s|_PRODUCT_API_URL_|http://$P:8000|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|http://$O:8001|g" frontend/main.js
+          az acr build -r ${{ env.ACR_LOGIN }} -t frontend:latest frontend
+          kubectl apply -f k8s/frontend.yaml
+          kubectl set image deploy/frontend frontend-container=${{ env.ACR_LOGIN }}/frontend:latest
+          kubectl rollout status deploy/frontend --timeout=300s
+      - run: az logout
